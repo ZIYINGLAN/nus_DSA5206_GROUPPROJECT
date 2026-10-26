@@ -3,6 +3,9 @@
 No fallback to a randomly initialized backbone is allowed in the experiment.
 """
 import importlib.util
+import hashlib
+import pickle
+import types
 import json
 from pathlib import Path
 from time import perf_counter
@@ -96,16 +99,82 @@ def checkpoint_coverage(model, filtered_state):
             'backbone_coverage_fraction':1.0,
             'ignored_missing_head_keys':[k for k in state if k.startswith('head.') and k not in filtered_state]}
 
-def load_eva_tiny(source, checkpoint, expected_sha):
+def checkpoint_safe_globals():
+    """Only the NumPy scalar reconstruction primitives needed for float64 metadata.
+
+    type(dtype(...)) supports both NumPy <1.25 and the newer Float64DType class.
+    No ndarray reconstructors, arbitrary metadata classes or global registration.
+    """
+    return [np.core.multiarray.scalar, np.dtype, type(np.dtype(np.float64))]
+
+def load_checkpoint_safely(checkpoint, expected_sha):
+    """Verify the same open file before one restricted deserialization.
+
+    Unsupported types fail closed. There is intentionally no weights_only=False
+    retry: an allowlist failure is not permission to execute checkpoint code.
+    """
     import torch
-    if sha256_file(checkpoint)!=expected_sha:
-        raise ValueError('Checkpoint integrity mismatch')
+    with open(checkpoint, 'rb') as stream:
+        digest=hashlib.sha256()
+        for chunk in iter(lambda: stream.read(1024*1024), b''):
+            digest.update(chunk)
+        if not expected_sha or digest.hexdigest()!=expected_sha:
+            raise ValueError('Checkpoint integrity mismatch')
+        stream.seek(0)
+        try:
+            # Do not remove any caller-preexisting entry when the context exits.
+            existing=torch.serialization.get_safe_globals()
+            additions=[entry for entry in checkpoint_safe_globals() if entry not in existing]
+            with torch.serialization.safe_globals(additions):
+                raw=torch.load(stream,map_location='cpu',weights_only=True)
+        except pickle.UnpicklingError as exc:
+            raise pickle.UnpicklingError(
+                'Restricted EVA-X checkpoint loading failed; unsupported metadata '
+                'must be inspected before extending the scoped allowlist. '
+                'No unrestricted pickle fallback was attempted. Original error: '
+                + str(exc)) from exc
+    if not isinstance(raw, dict):
+        raise ValueError('Expected an EVA-X checkpoint mapping')
+    return raw
+
+def _factory_with_preloaded_state(module, checkpoint, raw):
+    """Run the official factory bytecode with only its torch.load bound locally.
+
+    The pinned factory otherwise calls torch.load without weights_only, which
+    defaults to unrestricted pickle in torch 2.5.1. Bind this one function's
+    globals to an in-memory loader; do not patch torch.load or module globals.
+    Architecture construction and checkpoint_filter_fn remain official code.
+    """
+    def preloaded_load(path, map_location='cpu', **kwargs):
+        if str(path)!=str(checkpoint) or map_location!='cpu':
+            raise ValueError('Unexpected official factory load request')
+        return raw
+    factory=module.eva_x_tiny_patch16
+    namespace=dict(factory.__globals__)
+    namespace['torch']=types.SimpleNamespace(load=preloaded_load)
+    bound=types.FunctionType(factory.__code__,namespace,factory.__name__,
+                             factory.__defaults__,factory.__closure__)
+    return bound(pretrained=str(checkpoint))
+
+def checkpoint_metadata_report(raw):
+    """Report structure/scalar types, never tensor contents or optimizer values."""
+    scalars=[]
+    def visit(value, path):
+        if isinstance(value,np.generic):
+            scalars.append({'path':path,'type':type(value).__name__,'dtype':str(value.dtype)})
+        elif isinstance(value,dict):
+            for key,child in value.items():visit(child,path+'.'+str(key))
+        elif isinstance(value,(list,tuple)):
+            for i,child in enumerate(value):visit(child,path+f'[{i}]')
+    visit(raw,'checkpoint')
+    return {'top_level_keys':[str(k) for k in raw], 'numpy_scalars':scalars}
+
+def load_eva_tiny(source, checkpoint, expected_sha):
+    raw=load_checkpoint_safely(checkpoint,expected_sha)
     module=load_official_module(source)
     with warnings.catch_warnings(record=True) as captured:
         warnings.simplefilter('always')
-        # Exactly the official factory; strict=False output is audited below.
-        model=module.eva_x_tiny_patch16(pretrained=str(checkpoint))
-    raw=torch.load(checkpoint,map_location='cpu',weights_only=True)
+        model=_factory_with_preloaded_state(module,checkpoint,raw)
     filtered=module.checkpoint_filter_fn(raw,model)
     audit=checkpoint_coverage(model,filtered)
     if model.num_features!=192 or model.global_pool!='avg':
@@ -113,6 +182,12 @@ def load_eva_tiny(source, checkpoint, expected_sha):
     model.eval();model.requires_grad_(False)
     audit['warnings']=[str(w.message) for w in captured]
     audit['pooling']='official forward_head(pre_logits=True): mean patch tokens excluding prefix, fc_norm'
+    audit['deserialization']={
+        'weights_only':True, 'unrestricted_fallback':False,
+        'sha256_verified_before_deserialization':True,
+        'safe_globals':[t.__module__+'.'+t.__name__ for t in checkpoint_safe_globals()],
+        'official_factory_load':'already validated in-memory mapping; no second deserialization'}
+    audit['checkpoint_metadata']=checkpoint_metadata_report(raw)
     return model,audit
 
 def pooled_features(model, x):
